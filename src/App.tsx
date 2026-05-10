@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   GoogleAuthProvider,
   onAuthStateChanged,
@@ -12,7 +12,6 @@ import {
   doc,
   increment,
   onSnapshot,
-  orderBy,
   query,
   runTransaction,
   serverTimestamp,
@@ -20,7 +19,7 @@ import {
   type Timestamp,
 } from "firebase/firestore";
 import { getDownloadURL, ref, uploadBytes } from "firebase/storage";
-import { getFirebase, isFirebaseConfigured } from "./firebase";
+import { formatFirebaseError, getFirebase, isFirebaseConfigured } from "./firebase";
 
 type UploadKind = "data" | "label";
 
@@ -33,15 +32,11 @@ type EcgRecord = {
   mimeType: string;
   storagePath: string;
   downloadUrl: string;
-  /** Text label / notes paired with this row */
   labelText?: string | null;
-  /** Optional separate file used as label when uploadKind is data */
   labelFileName?: string | null;
   labelFileStoragePath?: string | null;
   labelFileDownloadUrl?: string | null;
-  /** When uploadKind is label — Firestore id of the data row this labels */
   linkedDataRecordId?: string | null;
-  /** Legacy fields from older saves */
   labels?: string;
   reportFileName?: string;
   reportStoragePath?: string;
@@ -62,6 +57,8 @@ export default function App() {
   const [linkedDataId, setLinkedDataId] = useState("");
   const [cameraKind, setCameraKind] = useState<UploadKind>("data");
   const [fileKind, setFileKind] = useState<UploadKind>("data");
+  const [draftCameraFile, setDraftCameraFile] = useState<File | null>(null);
+  const [draftDiskFile, setDraftDiskFile] = useState<File | null>(null);
   const [status, setStatus] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -71,6 +68,28 @@ export default function App() {
   const streamRef = useRef<MediaStream | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const cameraPreviewUrl = useMemo(() => {
+    if (!draftCameraFile?.type.startsWith("image/")) return null;
+    return URL.createObjectURL(draftCameraFile);
+  }, [draftCameraFile]);
+
+  const diskPreviewUrl = useMemo(() => {
+    if (!draftDiskFile?.type.startsWith("image/")) return null;
+    return URL.createObjectURL(draftDiskFile);
+  }, [draftDiskFile]);
+
+  useEffect(() => {
+    return () => {
+      if (cameraPreviewUrl) URL.revokeObjectURL(cameraPreviewUrl);
+    };
+  }, [cameraPreviewUrl]);
+
+  useEffect(() => {
+    return () => {
+      if (diskPreviewUrl) URL.revokeObjectURL(diskPreviewUrl);
+    };
+  }, [diskPreviewUrl]);
 
   const dataRecords = records.filter(
     (r) => r.uploadKind === "data" || r.uploadKind == null
@@ -105,18 +124,18 @@ export default function App() {
       return;
     }
     const { db } = getFirebase();
-    const q = query(
-      collection(db, RECORDS),
-      where("userId", "==", user.uid),
-      orderBy("createdAt", "desc")
-    );
+    const q = query(collection(db, RECORDS), where("userId", "==", user.uid));
     return onSnapshot(q, (snap) => {
-      setRecords(
-        snap.docs.map((d) => {
-          const x = d.data() as Omit<EcgRecord, "id">;
-          return { id: d.id, ...x };
-        })
-      );
+      const rows = snap.docs.map((d) => {
+        const x = d.data() as Omit<EcgRecord, "id">;
+        return { id: d.id, ...x };
+      });
+      rows.sort((a, b) => {
+        const ta = a.createdAt?.toMillis?.() ?? 0;
+        const tb = b.createdAt?.toMillis?.() ?? 0;
+        return tb - ta;
+      });
+      setRecords(rows);
     });
   }, [configured, user]);
 
@@ -149,103 +168,142 @@ export default function App() {
     if (labelAttachmentRef.current) labelAttachmentRef.current.value = "";
   }, []);
 
-  const uploadFlow = useCallback(
+  /** Upload one asset to Storage + Firestore (used only after explicit Submit). */
+  const persistUpload = useCallback(
     async (
       primary: File,
       kind: UploadKind,
-      extras: { linkedId: string | null }
+      extras: { linkedId: string | null },
+      includeLabelAttachment: boolean
     ) => {
-      if (kind === "label" && !extras.linkedId) {
-        setStatus("Choose which data this label belongs to");
-        setTimeout(() => setStatus(null), 2800);
-        return;
+      const u = await ensureUser();
+      const { db, storage } = getFirebase();
+      const stamp = Date.now();
+      const safe = sanitize(primary.name);
+
+      const primaryFolder =
+        kind === "data" ? `ecg_uploads/${u.uid}` : `ecg_label_uploads/${u.uid}`;
+      const primaryPath = `${primaryFolder}/${stamp}_${safe}`;
+      const mainRef = ref(storage, primaryPath);
+      await uploadBytes(mainRef, primary, {
+        contentType: primary.type || undefined,
+      });
+      const downloadUrl = await getDownloadURL(mainRef);
+
+      let labelFileName: string | undefined;
+      let labelFileStoragePath: string | undefined;
+      let labelFileDownloadUrl: string | undefined;
+
+      if (kind === "data" && includeLabelAttachment && labelAttachment) {
+        const lp = `ecg_label_attachments/${u.uid}/${stamp}_${sanitize(labelAttachment.name)}`;
+        const lr = ref(storage, lp);
+        await uploadBytes(lr, labelAttachment, {
+          contentType: labelAttachment.type || undefined,
+        });
+        labelFileDownloadUrl = await getDownloadURL(lr);
+        labelFileStoragePath = lp;
+        labelFileName = labelAttachment.name;
       }
 
-      setStatus(null);
-      setBusy(true);
-      try {
-        const u = await ensureUser();
-        const { db, storage } = getFirebase();
-        const stamp = Date.now();
-        const safe = sanitize(primary.name);
+      const text = labelText.trim();
+      const recordRef = doc(collection(db, RECORDS));
+      const statsRef = doc(db, STATS, STATS_DOC);
 
-        const primaryFolder =
-          kind === "data" ? `ecg_uploads/${u.uid}` : `ecg_label_uploads/${u.uid}`;
-        const primaryPath = `${primaryFolder}/${stamp}_${safe}`;
-        const mainRef = ref(storage, primaryPath);
-        await uploadBytes(mainRef, primary, {
-          contentType: primary.type || undefined,
-        });
-        const downloadUrl = await getDownloadURL(mainRef);
+      await runTransaction(db, async (tx) => {
+        const payload: Record<string, unknown> = {
+          userId: u.uid,
+          createdAt: serverTimestamp(),
+          uploadKind: kind,
+          fileName: primary.name,
+          mimeType: primary.type || "application/octet-stream",
+          storagePath: primaryPath,
+          downloadUrl,
+          labelText: text || null,
+        };
 
-        let labelFileName: string | undefined;
-        let labelFileStoragePath: string | undefined;
-        let labelFileDownloadUrl: string | undefined;
-
-        if (kind === "data" && labelAttachment) {
-          const lp = `ecg_label_attachments/${u.uid}/${stamp}_${sanitize(labelAttachment.name)}`;
-          const lr = ref(storage, lp);
-          await uploadBytes(lr, labelAttachment, {
-            contentType: labelAttachment.type || undefined,
-          });
-          labelFileDownloadUrl = await getDownloadURL(lr);
-          labelFileStoragePath = lp;
-          labelFileName = labelAttachment.name;
+        if (kind === "data") {
+          payload.labelFileName = labelFileName ?? null;
+          payload.labelFileStoragePath = labelFileStoragePath ?? null;
+          payload.labelFileDownloadUrl = labelFileDownloadUrl ?? null;
+          payload.linkedDataRecordId = null;
+        } else {
+          payload.linkedDataRecordId = extras.linkedId;
+          payload.labelFileName = null;
+          payload.labelFileStoragePath = null;
+          payload.labelFileDownloadUrl = null;
         }
 
-        const text = labelText.trim();
-        const recordRef = doc(collection(db, RECORDS));
-        const statsRef = doc(db, STATS, STATS_DOC);
-
-        await runTransaction(db, async (tx) => {
-          const payload: Record<string, unknown> = {
-            userId: u.uid,
-            createdAt: serverTimestamp(),
-            uploadKind: kind,
-            fileName: primary.name,
-            mimeType: primary.type || "application/octet-stream",
-            storagePath: primaryPath,
-            downloadUrl,
-            labelText: text || null,
-          };
-
-          if (kind === "data") {
-            payload.labelFileName = labelFileName ?? null;
-            payload.labelFileStoragePath = labelFileStoragePath ?? null;
-            payload.labelFileDownloadUrl = labelFileDownloadUrl ?? null;
-            payload.linkedDataRecordId = null;
-          } else {
-            payload.linkedDataRecordId = extras.linkedId;
-            payload.labelFileName = null;
-            payload.labelFileStoragePath = null;
-            payload.labelFileDownloadUrl = null;
-          }
-
-          tx.set(recordRef, payload);
-          tx.set(
-            statsRef,
-            { recordCount: increment(1), updatedAt: serverTimestamp() },
-            { merge: true }
-          );
-        });
-
-        resetExtras();
-        setStatus("Saved");
-        setTimeout(() => setStatus(null), 2500);
-      } catch (e) {
-        setStatus(e instanceof Error ? e.message : "Failed");
-      } finally {
-        setBusy(false);
-      }
+        tx.set(recordRef, payload);
+        tx.set(
+          statsRef,
+          { recordCount: increment(1), updatedAt: serverTimestamp() },
+          { merge: true }
+        );
+      });
     },
-    [ensureUser, labelAttachment, labelText, resetExtras]
+    [ensureUser, labelAttachment, labelText]
   );
+
+  const submitAll = useCallback(async () => {
+    type Task = { file: File; kind: UploadKind };
+    const tasks: Task[] = [];
+    if (draftCameraFile) tasks.push({ file: draftCameraFile, kind: cameraKind });
+    if (draftDiskFile) tasks.push({ file: draftDiskFile, kind: fileKind });
+
+    if (tasks.length === 0) {
+      setStatus("Capture or choose a file first");
+      setTimeout(() => setStatus(null), 2800);
+      return;
+    }
+
+    for (const t of tasks) {
+      if (t.kind === "label" && !linkedDataId) {
+        setStatus("Choose which data a label upload belongs to");
+        setTimeout(() => setStatus(null), 3200);
+        return;
+      }
+    }
+
+    setStatus(null);
+    setBusy(true);
+    let attachmentConsumed = false;
+    try {
+      for (const t of tasks) {
+        const includeAttach =
+          t.kind === "data" && !!labelAttachment && !attachmentConsumed;
+        if (includeAttach) attachmentConsumed = true;
+        await persistUpload(t.file, t.kind, { linkedId: linkedDataId || null }, includeAttach);
+      }
+      setDraftCameraFile(null);
+      setDraftDiskFile(null);
+      resetExtras();
+      setStatus("Saved");
+      setTimeout(() => setStatus(null), 2500);
+    } catch (e) {
+      setStatus(formatFirebaseError(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [
+    draftCameraFile,
+    draftDiskFile,
+    cameraKind,
+    fileKind,
+    linkedDataId,
+    labelAttachment,
+    persistUpload,
+    resetExtras,
+  ]);
 
   const startCamera = async () => {
     setStatus(null);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: "environment" } },
+        video: {
+          facingMode: { ideal: "environment" },
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
+        },
         audio: false,
       });
       streamRef.current?.getTracks().forEach((t) => t.stop());
@@ -267,6 +325,7 @@ export default function App() {
     setCameraOn(false);
   };
 
+  /** Saves scan locally only — Firebase runs on Submit. */
   const capturePhoto = () => {
     const video = videoRef.current;
     if (!video?.videoWidth) return;
@@ -282,12 +341,12 @@ export default function App() {
         const file = new File([blob], `photo-${Date.now()}.jpg`, {
           type: "image/jpeg",
         });
-        void uploadFlow(file, cameraKind, {
-          linkedId: linkedDataId || null,
-        });
+        setDraftCameraFile(file);
+        setStatus("Scan saved — review and tap Submit");
+        setTimeout(() => setStatus(null), 2200);
       },
       "image/jpeg",
-      0.9
+      0.92
     );
   };
 
@@ -297,7 +356,7 @@ export default function App() {
     try {
       await signInWithPopup(getFirebase().auth, new GoogleAuthProvider());
     } catch (e) {
-      setStatus(e instanceof Error ? e.message : "Sign-in failed");
+      setStatus(formatFirebaseError(e));
     } finally {
       setBusy(false);
     }
@@ -309,7 +368,7 @@ export default function App() {
     try {
       await signOut(getFirebase().auth);
     } catch (e) {
-      setStatus(e instanceof Error ? e.message : "Sign out failed");
+      setStatus(formatFirebaseError(e));
     } finally {
       setBusy(false);
     }
@@ -319,7 +378,9 @@ export default function App() {
     e.preventDefault();
     const file = e.dataTransfer.files[0];
     if (file) {
-      void uploadFlow(file, fileKind, { linkedId: linkedDataId || null });
+      setDraftDiskFile(file);
+      setStatus("File ready — tap Submit to upload");
+      setTimeout(() => setStatus(null), 2200);
     }
   };
 
@@ -327,7 +388,9 @@ export default function App() {
     const file = e.target.files?.[0];
     e.target.value = "";
     if (file) {
-      void uploadFlow(file, fileKind, { linkedId: linkedDataId || null });
+      setDraftDiskFile(file);
+      setStatus("File ready — tap Submit to upload");
+      setTimeout(() => setStatus(null), 2200);
     }
   };
 
@@ -342,6 +405,11 @@ export default function App() {
   const signedInWithGoogle = Boolean(user && !user.isAnonymous);
   const needsLinkUpload = fileKind === "label" && !linkedDataId;
   const needsLinkCamera = cameraKind === "label" && !linkedDataId;
+  const hasDraft = Boolean(draftCameraFile || draftDiskFile);
+  const canSubmit =
+    hasDraft &&
+    !(cameraKind === "label" && draftCameraFile && !linkedDataId) &&
+    !(fileKind === "label" && draftDiskFile && !linkedDataId);
 
   return (
     <div className="shell">
@@ -387,7 +455,7 @@ export default function App() {
         <textarea
           className="shared-label-input"
           rows={2}
-          placeholder="Optional — applies to camera capture and file upload"
+          placeholder="Optional — applied when you submit"
           value={labelText}
           onChange={(e) => setLabelText(e.target.value)}
           disabled={busy}
@@ -397,6 +465,10 @@ export default function App() {
 
       <main className="workspace">
         <section className="pane pane-camera">
+          <div className="pane-camera-heading">
+            <span className="pane-camera-title">Scanner</span>
+            <span className="pane-camera-sub">Capture ECG strip or document</span>
+          </div>
           <KindToggle
             value={cameraKind}
             onChange={setCameraKind}
@@ -411,7 +483,7 @@ export default function App() {
               disabled={busy}
             />
           )}
-          <div className="pane-frame">
+          <div className="pane-frame scanner-pane">
             <video
               ref={videoRef}
               className={`camera-video ${cameraOn ? "on" : ""}`}
@@ -421,7 +493,38 @@ export default function App() {
             {!cameraOn && (
               <div className="camera-placeholder">Camera off</div>
             )}
+            {cameraOn && (
+              <div className="scanner-ui" aria-hidden>
+                <div className="scanner-vignette" />
+                <div className="scanner-target">
+                  <span className="scanner-corner scanner-corner-tl" />
+                  <span className="scanner-corner scanner-corner-tr" />
+                  <span className="scanner-corner scanner-corner-bl" />
+                  <span className="scanner-corner scanner-corner-br" />
+                  <div className="scanner-scanline" />
+                </div>
+                <div className="scanner-hud">
+                  <span className="scanner-hud-badge">Live</span>
+                  <p className="scanner-hud-text">
+                    Fit the waveform or paper inside the corners — hold steady, then capture
+                  </p>
+                </div>
+              </div>
+            )}
           </div>
+          {draftCameraFile && cameraPreviewUrl && (
+            <div className="draft-preview">
+              <img src={cameraPreviewUrl} alt="Scan preview" />
+              <button
+                type="button"
+                className="btn-clear-draft"
+                onClick={() => setDraftCameraFile(null)}
+                disabled={busy}
+              >
+                Clear scan
+              </button>
+            </div>
+          )}
           <div className="pane-actions">
             {!cameraOn ? (
               <button type="button" onClick={startCamera} disabled={busy}>
@@ -435,7 +538,7 @@ export default function App() {
                   onClick={capturePhoto}
                   disabled={busy || needsLinkCamera}
                 >
-                  Capture
+                  Capture scan
                 </button>
                 <button type="button" className="btn-ghost" onClick={stopCamera} disabled={busy}>
                   Stop
@@ -486,11 +589,40 @@ export default function App() {
               ↑
             </span>
             <span className="drop-label">
-              {needsLinkUpload ? "Choose linked data first" : "Drop or tap to upload"}
+              {needsLinkUpload
+                ? "Choose linked data first"
+                : draftDiskFile
+                  ? draftDiskFile.name
+                  : "Tap to choose file (saved locally until Submit)"}
             </span>
           </div>
+          {draftDiskFile && diskPreviewUrl && (
+            <div className="draft-preview draft-preview-compact">
+              <img src={diskPreviewUrl} alt="" />
+              <button
+                type="button"
+                className="btn-clear-draft"
+                onClick={() => setDraftDiskFile(null)}
+                disabled={busy}
+              >
+                Clear file
+              </button>
+            </div>
+          )}
         </section>
       </main>
+
+      <div className="submit-bar">
+        <button
+          type="button"
+          className="submit-primary"
+          onClick={() => void submitAll()}
+          disabled={busy || !canSubmit}
+        >
+          Submit to cloud
+        </button>
+        <p className="submit-note">Nothing uploads until you tap Submit.</p>
+      </div>
 
       {(fileKind === "data" || cameraKind === "data") && (
         <footer className="extras">
@@ -501,7 +633,7 @@ export default function App() {
               disabled={busy}
               onChange={(e) => setLabelAttachment(e.target.files?.[0] ?? null)}
             />
-            <span>{labelAttachment ? labelAttachment.name : "Label file"}</span>
+            <span>{labelAttachment ? labelAttachment.name : "Extra label file"}</span>
           </label>
         </footer>
       )}

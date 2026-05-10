@@ -44,11 +44,12 @@ export function getFirebase(): {
     });
     analyticsReady = ensureAnalytics(app);
   }
+  const bucketId = required("VITE_FIREBASE_STORAGE_BUCKET").replace(/^gs:\/\//, "");
   return {
     app,
     auth: getAuth(app),
     db: getFirestore(app),
-    storage: getStorage(app),
+    storage: getStorage(app, `gs://${bucketId}`),
     analytics,
     analyticsReady: analyticsReady ?? Promise.resolve(null),
   };
@@ -60,4 +61,45 @@ export function isFirebaseConfigured(): boolean {
   } catch {
     return false;
   }
+}
+
+/** Maps Firebase errors to short, actionable text (especially for mobile / LAN testing). */
+export function formatFirebaseError(err: unknown): string {
+  const code =
+    typeof err === "object" && err !== null && "code" in err
+      ? String((err as { code?: string }).code)
+      : "";
+  const fallback = err instanceof Error ? err.message : "Something went wrong";
+
+  if (code === "auth/configuration-not-found") {
+    return [
+      "Firebase Authentication isn’t set up for this project.",
+      "Fix: Firebase Console → Authentication → open “Get started”.",
+      "Then Sign-in methods → Anonymous → Enable.",
+      "If the phone opens your app via http://YOUR-PC-IP:5173, also add that exact host under Authentication → Settings → Authorized domains.",
+    ].join(" ");
+  }
+
+  if (code === "auth/unauthorized-domain") {
+    return [
+      "This web address isn’t allowed for Firebase Auth.",
+      "Firebase Console → Authentication → Settings → Authorized domains → add your host (e.g. ecg-waveforms.vercel.app, localhost, or your LAN IP).",
+    ].join(" ");
+  }
+
+  if (
+    code.startsWith("storage/") ||
+    /cors|preflight|access-control|blocked by cors/i.test(fallback)
+  ) {
+    return [
+      "Storage upload failed — often the Cloud Storage bucket needs a CORS rule for your dev URL.",
+      "Install Google Cloud SDK, then from this project folder run:",
+      "gsutil cors set storage-cors.json gs://YOUR_BUCKET",
+      "Replace YOUR_BUCKET with Project settings → storageBucket (e.g. gs://ecg-waveforms.firebasestorage.app).",
+      "Add http://YOUR-LAN-IP:5173 to storage-cors.json origins if you test from a phone.",
+      "Also confirm Firebase Console → Storage is enabled and storage.rules are deployed.",
+    ].join(" ");
+  }
+
+  return fallback;
 }
